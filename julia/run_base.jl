@@ -13,9 +13,12 @@ using .BaseDengueModel
 using Dates
 using Printf
 using Plots
+using DifferentialEquations
+using Optimization, OptimizationOptimJL
+using Optimization.AutoZygote
 
 # ---------------------------
-# 1. Load Indonesia monthly dengue incidence
+# 1. Load Peru monthly dengue incidence
 # ---------------------------
 
 # repo root is one level up from julia/
@@ -26,122 +29,150 @@ records = idn.records
 
 println("Loaded $(length(records)) monthly records for $(idn.country) ($(idn.iso_code)).")
 
-# Time span in days relative to the first record start date
+# Take the first record's start date as t = 0
 start_date = first(records).start_date
 end_date   = last(records).end_date
 total_days = Dates.value(end_date - start_date) + 1
-tspan = (0.0, float(total_days))
+
+# We'll run the ODE in **weeks**, so convert days -> weeks
+tspan_weeks = (0.0, total_days / 7.0)
+
+# Build time points (in weeks) for each record (use midpoints of months)
+t_data = Float64[]
+cases_data = Float64[]
+years = Int[]
+months = Int[]
+
+for rec in records
+    Δ_start   = rec.start_date - start_date
+    Δ_end     = rec.end_date   - start_date
+    tmid_days = (Dates.value(Δ_start) + Dates.value(Δ_end)) / 2
+    tmid_weeks = tmid_days / 7.0
+
+    push!(t_data, tmid_weeks)
+    push!(cases_data, Float64(rec.dengue_total))
+    push!(years, rec.year)
+    push!(months, month(rec.start_date))
+end
+
+println("Time span: $(tspan_weeks[1]) to $(tspan_weeks[2]) weeks.")
+println("Number of data points: $(length(t_data))")
 
 # ---------------------------
 # 2. Set parameters and initial conditions
 # ---------------------------
 
 # Rough scales – you can refine these later
-NH0  = 270e6     # ~ total population of Indonesia (order of magnitude)
-NMI0 = 1e8       # aquatic mosquitoes (arbitrary but large)
-NMA0 = 1e8       # adult mosquitoes (arbitrary but large)
-
-# Parameter set: fixed parameters from table, λ_VH and λ_HV as initial guesses
-p = BaseDengueModel.BaseParams(
-    λ_VH = 1e-8,   # initial guess – to be calibrated
-    λ_HV = 1e-8    # initial guess – to be calibrated
-    # everything else uses defaults from BaseParams
-)
+NH0  = 30457.6    # ~ total population of Peru in thousands in 2015
+NMA0 = 30457000*2     # adult mosquitoes (rough guess)
+NMI0 = NMA0 * 0.5     # aquatic mosquitoes (rough guess)
 
 u0 = BaseDengueModel.initial_conditions(NH0, NMI0, NMA0; ih_frac = 1e-5)
 
-println("Solving base ODE model over $(total_days) days...")
-sol = BaseDengueModel.solve_base_model(u0, p, tspan)
+# Baseline parameter template (everything fixed except the three we fit)
+p0 = BaseDengueModel.BaseParams()
 
-# ---------------------------
-# 3. Sample model at monthly points and compare with data
-# ---------------------------
+# Free parameters: [Β_V, Β_H, δ_H]
+p_free0 = [p0.Β_V, p0.Β_H, p0.δ_H]
 
-# Use the end of each calendar interval as the sampling time
-ts_monthly = Float64[]
-for rec in records
-    t = Dates.value(rec.end_date - start_date) |> float
-    push!(ts_monthly, t)
+# Helper to rebuild full BaseParams from free params
+function make_params(p_free, p_template::BaseDengueModel.BaseParams)
+    Β_V_fit, Β_H_fit, δ_H_fit = p_free
+
+    return BaseDengueModel.BaseParams(
+        Π_H  = p_template.Π_H,
+        μ_H  = p_template.μ_H,
+        σ_H  = p_template.σ_H,
+        γ_H  = p_template.γ_H,
+        δ_H  = δ_H_fit,
+        Β_V  = Β_V_fit,
+        Β_H  = Β_H_fit,
+        α    = p_template.α,
+        Π_V  = p_template.Π_V,
+        μ_VI = p_template.μ_VI,
+        μ_VA = p_template.μ_VA,
+        σ_V  = p_template.σ_V
+    )
 end
 
-# Model "incidence proxy": infectious humans at that time (I_H)
-I_H_model = [sol(t)[BaseDengueModel.IDX_IH] for t in ts_monthly]
-cases_data = [rec.dengue_total for rec in records]
+const IDX_IH = BaseDengueModel.IDX_IH
+
+# ---------------------------
+# 3. Simulation + loss for optimization
+# ---------------------------
+
+function simulate_IH(p_free)
+    p_all = make_params(p_free, p0)
+    prob  = ODEProblem(BaseDengueModel.dengue_rhs!, u0, tspan_weeks, p_all)
+
+    sol = solve(prob; saveat = t_data)
+
+    # I_H at each data time point
+    return [sol[i][IDX_IH] for i in eachindex(t_data)]
+end
+
+# Simple sum-of-squares loss between model I_H and reported monthly cases
+# (we're treating I_H as a proxy for incidence here)
+function loss(p_free, _)
+    I_model = simulate_IH(p_free)
+    return sum((I_model .- cases_data).^2)
+end
+
+# ---------------------------
+# 4. Run optimization
+# ---------------------------
+
+println("\nRunning parameter optimization for [Β_V, Β_H, δ_H]...")
+
+lower = [0.1, 0.05, 0.0]      # Β_V, Β_H, δ_H ≥ 0
+upper = [0.85, 0.85, 1e-3]    # biologically reasonable bounds
+
+opt_fun  = OptimizationFunction(loss, AutoZygote())
+opt_prob = OptimizationProblem(opt_fun, p_free0; lb = lower, ub = upper)
+
+res = Optimization.solve(opt_prob, Fminbox(BFGS()))
+
+p_free_est = res.u
+println("\n=== Estimated free parameters ===")
+println("Β_V  (human -> vector bite infection): ", p_free_est[1])
+println("Β_H  (vector -> human bite infection): ", p_free_est[2])
+println("δ_H  (dengue-induced human mortality): ", p_free_est[3])
+println("Final loss: ", res.minimum)
+
+p_est = make_params(p_free_est, p0)
+println("\nFull fitted BaseParams: ")
+println(p_est)
+
+# ---------------------------
+# 5. Compare model vs data and plot
+# ---------------------------
+
+# Re-simulate with fitted parameters
+prob_est = ODEProblem(BaseDengueModel.dengue_rhs!, u0, tspan_weeks, p_est)
+sol_est  = solve(prob_est; saveat = t_data)
+I_model_est = [sol_est[i][IDX_IH] for i in eachindex(t_data)]
 
 println("\nFirst few months: model infectious humans vs reported cases")
-println("Year  Month  t(days)  I_H(model)      cases(data)")
-println("----  -----  -------  ------------   -----------")
+println("Year  Month  t(weeks)   I_H(model)      cases(data)")
+println("----  -----  ---------  -------------  -----------")
 
-for i in 1:min(6, length(records))
-    rec = records[i]
-    t   = ts_monthly[i]
-    println(@sprintf("%4d  %5d  %7.1f  %12.3e   %11d",
-        rec.year, month(rec.start_date), t, I_H_model[i], cases_data[i]))
+for i in 1:min(6, length(t_data))
+    println(@sprintf("%4d  %5d  %9.2f  %13.3e  %11.0f",
+        years[i], months[i], t_data[i], I_model_est[i], cases_data[i]))
 end
 
-println("\n=== Calibrated parameter values ===")
-
-# Replace these with your actual field names
-println("λ_VH (vector → human FOI): ", p.λ_VH)
-println("λ_HV (human → vector FOI): ", p.λ_HV)
-
-println("σ_V  (maturation rate VI → VA): ", p.σ_V)
-println("δ_VI (extra immature mosquito mortality): ", p.δ_VI)
-println("δ_VA (extra adult mosquito mortality): ", p.δ_VA)
-
-println("μ_H  (fixed human natural mortality): ", p.μ_H)
-println("Π_H  (fixed human recruitment): ", p.Π_H)
-
-ts  = IDNData.load_idn_monthly_cases()
-
-records = ts.records
-
-# Take the first record's start date as t = 0
-t0 = records[1].start_date
-
-t_days   = Float64[]
-I_model  = Float64[]
-cases    = Float64[]
-years    = Int[]
-months   = Int[]
-
-for rec in records
-    # center of the month in "days since t0"
-    Δ_start = rec.start_date - t0   # Day
-    Δ_end   = rec.end_date   - t0   # Day
-    tmid = (Dates.value(Δ_start) + Dates.value(Δ_end)) / 2  # Float64 days
-
-    push!(t_days, tmid)
-    push!(years, rec.year)
-    push!(months, month(rec.start_date))   # uses Dates.month(...)
-    
-    # Evaluate solution at tmid (assuming u = [S_H, E_H, I_H, ...])
-    u_t = sol(tmid)
-    I_H_t = u_t[3]   # Infectious humans
-    push!(I_model, I_H_t)
-
-    push!(cases, rec.dengue_total)
-end
-
-# Simple time-series plot
+# Time-series plot
 plt = plot(
-    t_days, I_model,
+    t_data, I_model_est,
     label = "Model I_H(t)",
-    xlabel = "Days since first record",
-    ylabel = "Count",
+    xlabel = "Time (weeks since first record)",
+    ylabel = "Count (arbitrary units)",
     lw = 2,
 )
 
-plot!(t_days, cases,
+plot!(t_data, cases_data,
       label = "Reported cases",
       lw = 2,
-      seriestype = :scatter,
-)
+      seriestype = :scatter)
 
 display(plt)
-
-# (Optional) you can add plotting if Plots.jl is in your environment:
-# using Plots
-# plot(ts_monthly ./ 30.0, I_H_model, label="I_H model (scaled)",
-#      xlabel="time (months since start)", ylabel="infectious humans")
-# scatter!(ts_monthly ./ 30.0, cases_data, label="reported cases")

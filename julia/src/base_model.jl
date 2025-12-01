@@ -7,28 +7,31 @@ Parameter definitions for the module
 """
 
 Base.@kwdef mutable struct BaseParams
-    # Human demography
-    Π_H::Float64    = 4.4e-5      # 1/day, crude birth rate per capita
-    μ_H::Float64    = 5.0e-5      # 1/day, natural mortality per capita
+    # Human demography [Peru 2015]
+    Π_H::Float64    = 10.54      # 1000s/week crude birth rate DONE
+    μ_H::Float64    = 0.000000252      # /1000people/week, natural mortality per capita Peru DONE
 
-    # Human dengue progression (fixed from table at representative temperature)
-    σ_H::Float64    = 0.15        # 1/day, exposed -> infectious
-    γ_H::Float64    = 0.1428      # 1/day, recovery
-    δ_H::Float64    = 1e-4        # 1/day, dengue-induced mortality (small)
+    # Human dengue progression (fixed)
+    σ_H::Float64    = 1.05        # 1/week, exposeure incubation -> infectious DONE
+    γ_H::Float64    = 0.9996      # 1/week, recovery DONE
 
-    # Forces of infection (to be calibrated)
-    λ_VH::Float64   = 1e-8        # 1/day, vector -> human FOI
-    λ_HV::Float64   = 1e-8        # 1/day, human -> vector FOI
+    # dengue induced mortality TO BE LEARNED
+    δ_H::Float64    = 1e-7        # 1000s/week, dengue-induced mortality (small) DONE
+
+    # Forces of infection (TO BE LEARNED)
+    Β_V::Float64   = 0.5         # bite infection rate of vector from biting Human DONE
+    Β_H::Float64   = 0.4         # bite infection rate of human from getting bit by vector DONE
+
+    # biting rate of F mosquitoes on all humans (fixed)
+    α::Float64     = 0.84         # bites/mosquito/week DONE
 
     # Mosquito demography (no temperature dependence in this base model)
-    Π_V::Float64    = 0.5         # 1/day, per capita recruitment of immatures from adults (placeholder)
-    μ_VI::Float64   = 0.1         # 1/day, immature natural mortality (placeholder)
-    μ_VA::Float64   = 0.1         # 1/day, adult natural mortality (placeholder)
+    Π_V::Float64    = 75.04         # 1/week,, per capita birth rate DONE
+    μ_VI::Float64   = 0.3261         # 1/week, immature mortality DONE
+    μ_VA::Float64   = 0.2495         # 1/week, adult mortality DONE
 
     # Mosquito progression and disease-related mortality (fixed from table)
-    σ_V::Float64    = 0.1         # 1/day, maturation immature -> adult
-    δ_VI::Float64   = 0.01        # 1/day, extra mortality infected immature
-    δ_VA::Float64   = 0.01        # 1/day, extra mortality infected adult
+    σ_V::Float64    = 0.5502         #1/week, maturation immature -> adult DONE
 end
 
 # State indices to keep everything readable
@@ -61,6 +64,10 @@ function dengue_rhs!(du, u, p::BaseParams, t)
     S_VA = u[IDX_SVA]
     I_VA = u[IDX_IVA]
 
+    # totals
+    N_H  = S_H + E_H + I_H + R_H
+    # N_VA = S_VA + I_VA
+
     # unpack parameters
     Π_H  = p.Π_H
     μ_H  = p.μ_H
@@ -68,21 +75,33 @@ function dengue_rhs!(du, u, p::BaseParams, t)
     γ_H  = p.γ_H
     δ_H  = p.δ_H
 
-    λ_VH = p.λ_VH
-    λ_HV = p.λ_HV
+    Β_V = p.Β_V
+    Β_H = p.Β_H
+    α   = p.α
 
     Π_V  = p.Π_V
     μ_VI = p.μ_VI
     μ_VA = p.μ_VA
     σ_V  = p.σ_V
-    δ_VI = p.δ_VI
-    δ_VA = p.δ_VA
+    # δ_VI = p.δ_VI
+    # δ_VA = p.δ_VA
 
+    # ------------------
+    # Vector Transmission Forces Equations
+    # ------------------
+    if N_H > 0
+        λ_HV = α * Β_V * (I_H / N_H)  # humans -> vectors
+        λ_VH = α * Β_H * (I_H / N_H)  # vectors -> humans
+    else
+        λ_HV = 0.0
+        λ_VH = 0.0
+    end
+    
     # ------------------
     # Human SEIR dynamics (no T(t))
     # ------------------
-    # dS_H/dt = (Π_H - μ_H) S_H - λ_VH S_H
-    du[IDX_SH] = (Π_H - μ_H) * S_H - λ_VH * S_H
+    # dS_H/dt = Π_H - μ_H S_H - λ_VH S_H
+    du[IDX_SH] = Π_H - μ_H * S_H - λ_VH * S_H
 
     # dE_H/dt = λ_VH S_H - σ_H E_H - μ_H E_H
     du[IDX_EH] = λ_VH * S_H - σ_H * E_H - μ_H * E_H
@@ -100,7 +119,7 @@ function dengue_rhs!(du, u, p::BaseParams, t)
     du[IDX_SVI] = Π_V * S_VA - (μ_VI + σ_V) * S_VI
 
     # dI_VI/dt = Π_V I_VA - (μ_VI + δ_VI) I_VI - σ_V I_VI
-    du[IDX_IVI] = Π_V * I_VA - (μ_VI + δ_VI + σ_V) * I_VI
+    du[IDX_IVI] = Π_V * I_VA - (μ_VI + σ_V) * I_VI
 
     # ------------------
     # Mosquito adult dynamics, with vertical transmission and FOI from humans
@@ -109,7 +128,7 @@ function dengue_rhs!(du, u, p::BaseParams, t)
     du[IDX_SVA] = σ_V * S_VI - (μ_VA + λ_HV) * S_VA
 
     # dI_VA/dt = σ_V I_VI  - (μ_VA + δ_VA) I_VA + λ_HV S_VA
-    du[IDX_IVA] = σ_V * I_VI - (μ_VA + δ_VA) * I_VA + λ_HV * S_VA
+    du[IDX_IVA] = σ_V * I_VI - (μ_VA) * I_VA + λ_HV * S_VA
 
     return nothing
 end
